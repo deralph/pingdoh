@@ -4,7 +4,7 @@ export const users = {
   id: z.string(),
   email: z.string().email(),
   created_at: z.date(),
-  is_admin: z.boolean().default(false)
+  is_admin: z.boolean().default(false),
 };
 
 export const recordings = {
@@ -13,22 +13,25 @@ export const recordings = {
   audio_url: z.string(),
   status: z.enum(["pending", "under_review", "scored", "closed"]),
   ai_score: z.number().nullable(),
-  created_at: z.date()
+  ai_result: z.any().nullable(),
+  created_at: z.date(),
 };
 
 export const portalStatus = {
-  is_open: z.boolean()
+  is_open: z.boolean(),
 };
 
 export const insertUserSchema = z.object({
   email: z.string().email(),
-  is_admin: z.boolean().optional()
+  is_admin: z.boolean().optional(),
 });
 
 export const insertRecordingSchema = z.object({
   email: z.string().email(),
   audio_url: z.string(),
-  status: z.enum(["pending", "under_review", "scored", "closed"]).default("pending")
+  status: z
+    .enum(["pending", "under_review", "scored", "closed"])
+    .default("pending"),
 });
 
 export type InsertUser = z.infer<typeof insertUserSchema>;
@@ -46,6 +49,7 @@ export type Recording = {
   audio_url: string;
   status: "pending" | "under_review" | "scored" | "closed";
   ai_score: number | null;
+  ai_result: any;
   created_at: Date;
 };
 
