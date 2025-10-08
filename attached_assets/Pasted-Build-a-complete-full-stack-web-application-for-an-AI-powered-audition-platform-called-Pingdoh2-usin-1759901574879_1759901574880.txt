@@ -1,0 +1,112 @@
+Build a complete full-stack web application for an AI-powered audition platform called Pingdoh2 using the following stack:
+
+Frontend: React + Vite + TailwindCSS
+
+Backend: FastAPI (Python)
+
+Database: MongoDB Atlas
+
+Authentication: Simple email-based identification (no password) — just use email to identify users for now.
+
+🎤 Core Features
+👤 User (Contestant) UI
+
+Simple login/entry form (enter email → continue).
+
+Dashboard showing:
+
+“Record” button to record voice for audition (use browser MediaRecorder API).
+
+Display recording timer and allow re-record before final submit.
+
+“Submit Recording” button → uploads to backend via API.
+
+Show audition status: Pending, Under Review, Scored, or Closed.
+
+Display leaderboard (all contestants + their AI scores + ranking if available).
+
+If the admin has closed the audition portal, disable recording/submission and show message “Audition Closed”.
+
+🛠️ Admin UI
+
+Simple login page (admin email hard-coded or seeded in backend).
+
+Dashboard showing:
+
+All user submissions (email, file link, status, AI score if computed).
+
+Button “Close Audition Portal” — triggers backend flag to prevent further submissions.
+
+Once closed, backend automatically runs an AI scoring simulation (just generate random scores 0–100 for now).
+
+Leaderboard updates and appears for both admin & users.
+
+⚙️ Backend Requirements (FastAPI)
+
+Routes:
+
+POST /api/recordings — accept audio upload (multipart) and email, store to MongoDB (GridFS or URL reference).
+
+GET /api/recordings — admin-only, list all recordings.
+
+POST /api/close_audition — admin closes portal, triggers scoring.
+
+GET /api/status?email= — get user’s audition status and score if available.
+
+GET /api/leaderboard — return all contestants sorted by score (if scored).
+
+On close:
+
+Generate and store AI scores for each contestant.
+
+Update status to Scored.
+
+Use MongoDB Atlas for all persistent data (Users, Recordings, PortalStatus).
+
+🧠 Data Models (MongoDB)
+
+User: { email, created_at }
+
+Recording: { email, audio_url, status, ai_score }
+
+PortalStatus: { is_open: bool }
+
+📡 Integration Details
+
+Frontend must connect to backend via REST API endpoints.
+
+Use axios or fetch for all HTTP requests.
+
+Handle live state updates — e.g., when admin closes portal, user dashboard should reflect “Audition Closed”.
+
+Keep UI simple, clean, mobile-friendly.
+
+🧩 Deliverables
+
+frontend/ folder — complete React app (with pages/components for User and Admin).
+
+backend/ folder — FastAPI app (main.py, models, routes, MongoDB connection).
+
+Example .env for MongoDB Atlas connection.
+
+Instructions to run:
+
+npm install && npm run dev for frontend
+
+uvicorn main:app --reload for backend
+
+🎯 Additional Notes
+
+Keep code clean, minimal, and working out of the box.
+
+Include CORS handling so frontend can connect to backend locally.
+
+Generate realistic placeholder functions for AI scoring (random for now, can later connect to real model).
+
+Use modern React hooks (useState, useEffect, useContext for auth state).
+
+Keep everything in English, with basic comments for clarity.
+
+Output all code for both frontend and backend with folder structure and connection details.
+
+Make sure all code is runnable and complete.
