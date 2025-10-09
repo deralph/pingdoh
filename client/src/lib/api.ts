@@ -1,12 +1,38 @@
 // src/lib/api.ts
-export type AiResult = any; // refine if you have strict types
-export type RecordingResponse = { recording: any };
+export type AiFileScore = {
+  filename: string;
+  pitch: number;
+  rhythm: number;
+  tone: number;
+  expression: number;
+  consistency: number;
+  final_score: number;
+  rank?: number | null;
+};
+
+export type AiResult = {
+  task_id?: string;
+  status?: string;
+  results?: AiFileScore[];
+  message?: string;
+  [k: string]: any;
+};
+
+export type Recording = {
+  id: string;
+  email: string;
+  audio_url: string;
+  status: "pending" | "under_review" | "scored" | "closed";
+  ai_score: number | null;
+  created_at: string | Date;
+  ai_result?: AiResult | null;
+};
 
 export const api = {
   uploadRecording: async (
     email: string,
     audioBlob: Blob
-  ): Promise<RecordingResponse> => {
+  ): Promise<{ recording: Recording }> => {
     const formData = new FormData();
     formData.append("email", email);
     formData.append("audio", audioBlob, "recording.webm");
@@ -23,7 +49,13 @@ export const api = {
       throw new Error(err.message || "Upload failed");
     }
 
-    return (await response.json()) as RecordingResponse;
+    return (await response.json()) as { recording: Recording };
+  },
+
+  getRecording: async (id: string): Promise<{ recording: Recording }> => {
+    const resp = await fetch(`/api/recordings/${encodeURIComponent(id)}`);
+    if (!resp.ok) throw new Error("Failed to fetch recording");
+    return (await resp.json()) as { recording: Recording };
   },
 
   waitForAiResult: async (
@@ -32,70 +64,50 @@ export const api = {
   ) => {
     const start = Date.now();
     while (true) {
-      const resp = await fetch(
-        `/api/recordings/${encodeURIComponent(recordingId)}`
-      );
-      if (!resp.ok) throw new Error("Failed to fetch recording");
-      const { recording } = await resp.json();
-
+      const { recording } = await api.getRecording(recordingId);
       if (recording.ai_score !== null && recording.ai_score !== undefined) {
-        return recording; // contains ai_score & full ai_result
+        return recording;
       }
-
-      if (
-        recording.status === "ai_failed" ||
-        recording.status === "ai_timeout"
-      ) {
-        throw new Error("AI evaluation failed or timed out");
+      if (recording.status === "closed") {
+        throw new Error("AI evaluation failed/closed");
       }
-
       if (Date.now() - start > timeout) {
         throw new Error("Timed out waiting for AI result");
       }
-
       await new Promise((r) => setTimeout(r, interval));
     }
   },
 
-  getUserStatus: async (email: string) => {
-    const response = await fetch(
-      `/api/status?email=${encodeURIComponent(email)}`
-    );
-    if (!response.ok) {
-      throw new Error("Failed to get status");
-    }
-    return response.json();
+  getAllRecordings: async () => {
+    const resp = await fetch("/api/recordings");
+    if (!resp.ok) throw new Error("Failed to get recordings");
+    return (await resp.json()) as { recordings: Recording[] };
   },
 
-  getLeaderboard: async () => {
-    const response = await fetch("/api/leaderboard");
-    if (!response.ok) {
-      throw new Error("Failed to get leaderboard");
-    }
-    return response.json();
+  getUserStatus: async (email: string) => {
+    const resp = await fetch(`/api/status?email=${encodeURIComponent(email)}`);
+    if (!resp.ok) throw new Error("Failed to get status");
+    return (await resp.json()) as {
+      recording: Recording | null;
+      has_submitted: boolean;
+    };
   },
 
   getPortalStatus: async () => {
-    const response = await fetch("/api/portal-status");
-    if (!response.ok) {
-      throw new Error("Failed to get portal status");
-    }
-    return response.json();
-  },
-
-  getAllRecordings: async () => {
-    const response = await fetch("/api/recordings");
-    if (!response.ok) {
-      throw new Error("Failed to get recordings");
-    }
-    return response.json();
+    const resp = await fetch("/api/portal-status");
+    if (!resp.ok) throw new Error("Failed to get portal status");
+    return (await resp.json()) as { is_open: boolean };
   },
 
   closeAuditionPortal: async () => {
-    const response = await fetch("/api/close_audition", { method: "POST" });
-    if (!response.ok) {
-      throw new Error("Failed to close audition");
-    }
-    return response.json();
+    const resp = await fetch("/api/close_audition", { method: "POST" });
+    if (!resp.ok) throw new Error("Failed to close audition");
+    return await resp.json();
+  },
+
+  getLeaderboard: async () => {
+    const resp = await fetch("/api/leaderboard");
+    if (!resp.ok) throw new Error("Failed to get leaderboard");
+    return (await resp.json()) as { leaderboard: Recording[] };
   },
 };

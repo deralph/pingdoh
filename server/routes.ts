@@ -1,4 +1,4 @@
-// src/server-recordings.routes.ts
+// server-recordings.routes.ts
 import type { Express } from "express";
 import express from "express";
 import { createServer, type Server } from "http";
@@ -8,18 +8,28 @@ import path from "path";
 import fs from "fs";
 import fetch from "node-fetch";
 import FormData from "form-data";
+import { randomUUID } from "crypto";
 
-const AI_BASE = "http://16.170.164.187"; // temporary ai base url
+const AI_BASE = "https://recording-ai.com"; // temporary AI base
 
-// Uploads directory
+// Ensure uploads directory exists
 const uploadDir = path.join(process.cwd(), "uploads");
-if (!fs.existsSync(uploadDir)) {
-  fs.mkdirSync(uploadDir, { recursive: true });
-}
+if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
 
-// Multer config
+// Use diskStorage to preserve original extension
+const diskStorage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    cb(null, uploadDir);
+  },
+  filename: (req, file, cb) => {
+    const ext = path.extname(file.originalname) || "";
+    const filename = `${Date.now()}-${randomUUID()}${ext}`;
+    cb(null, filename);
+  },
+});
+
 const upload = multer({
-  dest: uploadDir,
+  storage: diskStorage,
   fileFilter: (req, file, cb) => {
     if (file.mimetype.startsWith("audio/")) cb(null, true);
     else cb(new Error("Only audio files are allowed"));
@@ -27,11 +37,16 @@ const upload = multer({
   limits: { fileSize: 10 * 1024 * 1024 }, // 10MB
 });
 
-// Background helper: uploads to AI, polls, updates recording status following allowed statuses:
-// "pending" -> "under_review" -> "scored" (success) or "closed" (fail/timeout).
+type RecordingId = string;
+
+/**
+ * Upload local file to AI backend, poll result, update storage.
+ * Status lifecycle (per your schema):
+ * - pending -> under_review -> scored (success) OR closed (fail/timeout)
+ */
 async function sendFileToAiAndUpdateRecording(
   localFilePath: string,
-  recordingId: string
+  recordingId: RecordingId
 ) {
   try {
     // Build multipart form
@@ -39,11 +54,11 @@ async function sendFileToAiAndUpdateRecording(
     const filename = path.basename(localFilePath);
     form.append("files", fs.createReadStream(localFilePath), { filename });
 
-    // POST to AI /evaluate/upload
+    // POST to AI evaluate/upload
     const uploadResp = await fetch(`${AI_BASE}/evaluate/upload`, {
       method: "POST",
       body: form as any,
-      // node-fetch + form-data compatibility
+      // ensure node-fetch + form-data headers are set
       // @ts-ignore
       headers: (form as any).getHeaders
         ? (form as any).getHeaders()
@@ -51,13 +66,15 @@ async function sendFileToAiAndUpdateRecording(
     });
 
     if (!uploadResp.ok) {
-      const text = await uploadResp.text().catch(() => "no body");
-      console.error("AI upload failed:", uploadResp.status, text);
-      // mark closed on failure
+      const txt = await uploadResp.text().catch(() => "");
+      console.error("AI upload failed:", uploadResp.status, txt);
       await storage.updateRecording(recordingId, {
         status: "closed",
         ai_score: null,
-        ai_result: { error: `AI upload failed: ${uploadResp.status}` },
+        ai_result: {
+          error: `AI upload failed (${uploadResp.status})`,
+          body: txt,
+        },
       });
       return;
     }
@@ -66,16 +83,19 @@ async function sendFileToAiAndUpdateRecording(
     const taskId: string | undefined = uploadJson?.task_id;
 
     if (!taskId) {
-      console.error("AI upload returned no task_id", uploadJson);
+      console.error("No task_id from AI upload:", uploadJson);
       await storage.updateRecording(recordingId, {
         status: "closed",
         ai_score: null,
-        ai_result: { error: "No task_id returned from AI upload" },
+        ai_result: {
+          error: "No task_id returned from AI upload",
+          raw: uploadJson,
+        },
       });
       return;
     }
 
-    // Move to under_review
+    // Mark under_review
     await storage.updateRecording(recordingId, { status: "under_review" });
 
     // Poll for results
@@ -90,15 +110,17 @@ async function sendFileToAiAndUpdateRecording(
         const res = await fetch(`${AI_BASE}/evaluate/results/${taskId}`);
         if (res.ok) {
           const json: any = await res.json();
-          if (json.status === "completed" || json.status === "failed") {
+          // AI statuses from your FastAPI used: queued/processing/completed/failed (we tolerate variations)
+          const s: string = json?.status ?? "";
+          if (s === "completed" || s === "failed") {
             finalResult = json;
             break;
           }
+          // else keep polling
         } else {
-          // log and continue polling (404/500 etc.)
           const txt = await res.text().catch(() => "");
           console.warn(
-            `AI results check (attempt ${attempt}) status=${res.status} body=${txt}`
+            `AI results check attempt ${attempt}: ${res.status} ${txt}`
           );
         }
       } catch (err) {
@@ -108,7 +130,6 @@ async function sendFileToAiAndUpdateRecording(
     }
 
     if (!finalResult) {
-      // timed out -> mark closed, ai_score null
       await storage.updateRecording(recordingId, {
         status: "closed",
         ai_score: null,
@@ -117,20 +138,23 @@ async function sendFileToAiAndUpdateRecording(
       return;
     }
 
-    // If AI returned results: derive ai_score (highest final_score) and set status to "scored"
     const results = Array.isArray(finalResult.results)
       ? finalResult.results
       : [];
-    let ai_score: number | null = null;
-    if (results.length > 0) {
-      ai_score = results.reduce((max: number, r: any) => {
-        const v = Number(r.final_score ?? 0);
-        return isFinite(v) ? Math.max(max, v) : max;
-      }, 0);
-    }
+    // derive ai_score (highest final_score). You can change to average if desired.
+    const ai_score =
+      results.length > 0
+        ? results.reduce((max: number, r: any) => {
+            const v = Number(r.final_score ?? 0);
+            return isFinite(v) ? Math.max(max, v) : max;
+          }, 0)
+        : null;
 
+    // Update storage as 'scored' or 'closed' based on finalResult.status
+    const finalStatus =
+      finalResult?.status === "completed" ? "scored" : "closed";
     await storage.updateRecording(recordingId, {
-      status: "scored",
+      status: finalStatus,
       ai_score,
       ai_result: finalResult,
     });
@@ -145,7 +169,7 @@ async function sendFileToAiAndUpdateRecording(
 }
 
 export async function registerRoutes(app: Express): Promise<Server> {
-  // CORS
+  // CORS middleware
   app.use((req, res, next) => {
     res.header("Access-Control-Allow-Origin", "*");
     res.header("Access-Control-Allow-Methods", "GET,PUT,POST,DELETE,OPTIONS");
@@ -157,10 +181,10 @@ export async function registerRoutes(app: Express): Promise<Server> {
     else next();
   });
 
-  // Serve uploads
+  // Serve static uploads (express will set content-type based on extension)
   app.use("/uploads", express.static(uploadDir));
 
-  // Auth login (unchanged)
+  // auth/login (same as before)
   app.post("/api/auth/login", async (req, res) => {
     try {
       const { email } = req.body;
@@ -177,13 +201,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
-  /**
-   * POST /api/recordings
-   * - saves file with multer
-   * - creates recording with status "pending"
-   * - starts background AI upload/poll (fire-and-forget)
-   * - returns created recording immediately
-   */
+  // Upload recording - preserves extension so audio_url is usable
   app.post("/api/recordings", upload.single("audio"), async (req, res) => {
     try {
       const { email } = req.body;
@@ -192,27 +210,28 @@ export async function registerRoutes(app: Express): Promise<Server> {
           .status(400)
           .json({ message: "Email and audio file are required" });
 
-      // Check portal open
       const portalStatus = await storage.getPortalStatus();
       if (!portalStatus.is_open)
         return res.status(403).json({ message: "Audition portal is closed" });
 
-      // Ensure user hasn't already submitted
-      const existingRecordings = await storage.getRecordingsByEmail(email);
-      if (existingRecordings.length > 0)
+      const existing = await storage.getRecordingsByEmail(email);
+      if (existing.length > 0)
         return res
           .status(400)
           .json({ message: "User already has a recording submitted" });
 
-      // create recording record -> MemStorage.createRecording sets created_at: Date and ai_score: null
-      const audioUrl = `/uploads/${req.file.filename}`;
+      // Use the saved filename (which includes extension)
+      const savedFilename = (req.file as any).filename as string;
+      const audioUrl = `/uploads/${savedFilename}`;
+
+      // createRecording in MemStorage should set created_at: Date and ai_score: null by default
       const recording = await storage.createRecording({
         email,
         audio_url: audioUrl,
-        status: "pending", // matches allowed enum
+        status: "pending",
       });
 
-      // Fire-and-forget AI processing
+      // start background processing (fire-and-forget)
       const localFilePath = (req.file as any).path as string;
       setImmediate(() => {
         void sendFileToAiAndUpdateRecording(localFilePath, recording.id);
@@ -227,17 +246,13 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
-  // GET single recording (used by frontend to poll). Returns recording object matching the schema.
+  // GET single recording (frontend polls this)
   app.get("/api/recordings/:id", async (req, res) => {
     try {
       const id = req.params.id;
       const recording = await storage.getRecording(id);
       if (!recording)
         return res.status(404).json({ message: "Recording not found" });
-
-      // Ensure returned object follows schema keys:
-      // id, email, audio_url, status in allowed set, ai_score (number|null), created_at (Date)
-      // (Assumes storage.createRecording already created created_at: Date and ai_score: null)
       return res.json({ recording });
     } catch (error) {
       return res.status(500).json({
@@ -260,26 +275,20 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
-  /**
-   * Close audition portal:
-   * - sets portal closed,
-   * - simulates scoring for any recordings without ai_score by setting a random ai_score and status "scored"
-   */
+  // Close audition portal -> simulated scoring
   app.post("/api/close_audition", async (req, res) => {
     try {
       await storage.setPortalStatus({ is_open: false });
-
       const recordings = await storage.getAllRecordings();
       const scoringPromises = recordings
         .filter((r) => r.ai_score === null)
-        .map(async (recording) => {
-          const aiScore = Math.floor(Math.random() * 101); // 0-100
-          return storage.updateRecording(recording.id, {
+        .map(async (rec) => {
+          const aiScore = Math.floor(Math.random() * 101);
+          return storage.updateRecording(rec.id, {
             ai_score: aiScore,
-            status: "scored", // conform with schema
+            status: "scored",
           });
         });
-
       await Promise.all(scoringPromises);
       return res.json({
         message: "Audition portal closed and AI scoring completed",
@@ -292,12 +301,11 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
-  // Get user status
+  // status, leaderboard, portal-status (unchanged)
   app.get("/api/status", async (req, res) => {
     try {
       const { email } = req.query;
       if (!email) return res.status(400).json({ message: "Email is required" });
-
       const recordings = await storage.getRecordingsByEmail(email as string);
       const recording = recordings[0] || null;
       return res.json({ recording, has_submitted: !!recording });
@@ -309,14 +317,13 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
-  // Leaderboard: return only recordings with status "scored"
   app.get("/api/leaderboard", async (req, res) => {
     try {
       const recordings = await storage.getAllRecordings();
-      const scoredRecordings = recordings
+      const scored = recordings
         .filter((r) => r.status === "scored" && r.ai_score !== null)
         .sort((a, b) => (b.ai_score || 0) - (a.ai_score || 0));
-      return res.json({ leaderboard: scoredRecordings });
+      return res.json({ leaderboard: scored });
     } catch (error) {
       return res.status(500).json({
         message: "Failed to fetch leaderboard",
@@ -325,7 +332,6 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
-  // Portal status
   app.get("/api/portal-status", async (req, res) => {
     try {
       const status = await storage.getPortalStatus();
