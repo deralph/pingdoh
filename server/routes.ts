@@ -9,7 +9,7 @@ import fs from "fs";
 import fetch from "node-fetch";
 import FormData from "form-data";
 
-const AI_BASE = "https://recording-ai.com"; // temporary ai base url
+const AI_BASE = "http://16.170.164.187"; // temporary ai base url
 
 // Uploads directory
 const uploadDir = path.join(process.cwd(), "uploads");
