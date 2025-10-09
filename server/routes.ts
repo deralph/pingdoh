@@ -10,7 +10,7 @@ import fetch from "node-fetch";
 import FormData from "form-data";
 import { randomUUID } from "crypto";
 
-const AI_BASE = "https://recording-ai.com"; // temporary AI base
+const AI_BASE = "http://16.170.164.187"; // temporary AI base
 
 // Ensure uploads directory exists
 const uploadDir = path.join(process.cwd(), "uploads");
