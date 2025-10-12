@@ -2,25 +2,34 @@
 import type { Express } from "express";
 import express from "express";
 import { createServer, type Server } from "http";
-import { storage } from "./storage";
+import { storage } from "./storage"; // your MemStorage
 import multer from "multer";
 import path from "path";
 import fs from "fs";
 import fetch from "node-fetch";
 import FormData from "form-data";
+import ffmpeg from "fluent-ffmpeg";
+import ffmpegPath from "ffmpeg-static";
 import { randomUUID } from "crypto";
 
 const AI_BASE = "http://16.170.164.187"; // temporary AI base
 
-// Ensure uploads directory exists
+// Ensure ffmpeg path is set for fluent-ffmpeg
+if (ffmpegPath) {
+  ffmpeg.setFfmpegPath(ffmpegPath);
+} else {
+  console.warn(
+    "ffmpeg-static not found — ensure ffmpeg is installed on PATH for audio conversion to work."
+  );
+}
+
+// uploads dir
 const uploadDir = path.join(process.cwd(), "uploads");
 if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
 
-// Use diskStorage to preserve original extension
-const diskStorage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, uploadDir);
-  },
+// Use diskStorage so we can preserve extension
+const storageMulter = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, uploadDir),
   filename: (req, file, cb) => {
     const ext = path.extname(file.originalname) || "";
     const filename = `${Date.now()}-${randomUUID()}${ext}`;
@@ -29,61 +38,141 @@ const diskStorage = multer.diskStorage({
 });
 
 const upload = multer({
-  storage: diskStorage,
+  storage: storageMulter,
   fileFilter: (req, file, cb) => {
     if (file.mimetype.startsWith("audio/")) cb(null, true);
     else cb(new Error("Only audio files are allowed"));
   },
-  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB
+  limits: { fileSize: 20 * 1024 * 1024 }, // 20MB cap (adjust as needed)
 });
 
-type RecordingId = string;
+// utility: convert arbitrary audio file to mp3 (mono, 16k)
+function convertToMp3(inputPath: string, outputPath: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    // ensure output directory exists
+    const outDir = path.dirname(outputPath);
+    if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
 
-/**
- * Upload local file to AI backend, poll result, update storage.
- * Status lifecycle (per your schema):
- * - pending -> under_review -> scored (success) OR closed (fail/timeout)
- */
-async function sendFileToAiAndUpdateRecording(
-  localFilePath: string,
-  recordingId: RecordingId
+    // fluent-ffmpeg command: convert to mp3, mono, 16000Hz
+    ffmpeg(inputPath)
+      .audioChannels(1)
+      .audioFrequency(16000)
+      .format("mp3")
+      .on("error", (err: any) => {
+        reject(err);
+      })
+      .on("end", () => {
+        resolve();
+      })
+      .save(outputPath);
+  });
+}
+
+// upload mp3 to AI and poll results (robust)
+async function sendMp3ToAiAndUpdateRecording(
+  mp3Path: string,
+  recordingId: string
 ) {
-  try {
-    // Build multipart form
-    const form = new FormData();
-    const filename = path.basename(localFilePath);
-    form.append("files", fs.createReadStream(localFilePath), { filename });
+  const simulateIfNoAi = false; // toggle true for dev simulation if you don't have a real AI_BASE
+  const uploadRetries = 3;
+  const uploadBackoffMs = 1000;
+  const pollIntervalMs = 2000;
+  const pollMaxAttempts = 120;
 
-    // POST to AI evaluate/upload
-    const uploadResp = await fetch(`${AI_BASE}/evaluate/upload`, {
-      method: "POST",
-      body: form as any,
-      // ensure node-fetch + form-data headers are set
-      // @ts-ignore
-      headers: (form as any).getHeaders
-        ? (form as any).getHeaders()
-        : undefined,
+  try {
+    if (!AI_BASE) {
+      if (simulateIfNoAi) {
+        // simulate scoring
+        const ai_score = Math.floor(Math.random() * 101);
+        await storage.updateRecording(recordingId, {
+          status: "scored",
+          ai_score,
+          ai_result: {
+            simulated: true,
+            message: "Simulated score (AI_BASE not configured)",
+          },
+        });
+        console.log(
+          "Simulated AI scoring for",
+          recordingId,
+          "score:",
+          ai_score
+        );
+        return;
+      } else {
+        const errMsg =
+          "AI_BASE not configured in environment. Set AI_BASE to your AI host.";
+        console.error(errMsg);
+        await storage.updateRecording(recordingId, {
+          status: "closed",
+          ai_score: null,
+          ai_result: { error: errMsg },
+        });
+        return;
+      }
+    }
+
+    // UPLOAD mp3 with retries
+    const form = new FormData();
+    form.append("files", fs.createReadStream(mp3Path), {
+      filename: path.basename(mp3Path),
     });
 
-    if (!uploadResp.ok) {
-      const txt = await uploadResp.text().catch(() => "");
-      console.error("AI upload failed:", uploadResp.status, txt);
+    let uploadJson: any = null;
+    let lastUploadErr: any = null;
+    for (let attempt = 1; attempt <= uploadRetries; attempt++) {
+      try {
+        const resp = await fetch(`${AI_BASE}/evaluate/upload`, {
+          method: "POST",
+          body: form as any,
+          // @ts-ignore - form.getHeaders for node
+          headers: (form as any).getHeaders
+            ? (form as any).getHeaders()
+            : undefined,
+        });
+
+        const txt = await resp.text().catch(() => "");
+        if (!resp.ok) {
+          lastUploadErr = { status: resp.status, body: txt };
+          console.warn(
+            `AI upload attempt ${attempt} failed status=${resp.status} body=${txt}`
+          );
+          // retry
+        } else {
+          // parse JSON if possible
+          try {
+            uploadJson = JSON.parse(txt || "{}");
+          } catch {
+            uploadJson = {};
+          }
+          break;
+        }
+      } catch (err: any) {
+        lastUploadErr = err;
+        console.warn(
+          `AI upload attempt ${attempt} threw:`,
+          err?.message ?? err
+        );
+      }
+      await new Promise((r) => setTimeout(r, uploadBackoffMs * attempt));
+    }
+
+    if (!uploadJson) {
+      console.error("AI upload failed after retries:", lastUploadErr);
       await storage.updateRecording(recordingId, {
         status: "closed",
         ai_score: null,
         ai_result: {
-          error: `AI upload failed (${uploadResp.status})`,
-          body: txt,
+          error: "AI upload failed after retries",
+          detail: String(lastUploadErr?.message ?? lastUploadErr),
         },
       });
       return;
     }
 
-    const uploadJson: any = await uploadResp.json().catch(() => ({}));
     const taskId: string | undefined = uploadJson?.task_id;
-
     if (!taskId) {
-      console.error("No task_id from AI upload:", uploadJson);
+      console.error("AI upload returned no task_id:", uploadJson);
       await storage.updateRecording(recordingId, {
         status: "closed",
         ai_score: null,
@@ -95,81 +184,132 @@ async function sendFileToAiAndUpdateRecording(
       return;
     }
 
-    // Mark under_review
+    console.log(
+      `AI upload successful, task_id=${taskId}. Marking under_review.`
+    );
     await storage.updateRecording(recordingId, { status: "under_review" });
 
-    // Poll for results
-    const intervalMs = 2000;
-    const maxAttempts = 120; // ~4 minutes
+    // Poll results
     let attempt = 0;
     let finalResult: any = null;
+    let lastPollError: any = null;
 
-    while (attempt < maxAttempts) {
+    while (attempt < pollMaxAttempts) {
       attempt++;
       try {
-        const res = await fetch(`${AI_BASE}/evaluate/results/${taskId}`);
-        if (res.ok) {
-          const json: any = await res.json();
-          // AI statuses from your FastAPI used: queued/processing/completed/failed (we tolerate variations)
-          const s: string = json?.status ?? "";
-          if (s === "completed" || s === "failed") {
-            finalResult = json;
-            break;
+        const res = await fetch(
+          `${AI_BASE}/evaluate/results/${encodeURIComponent(taskId)}`,
+          {
+            method: "GET",
+            headers: { Accept: "application/json" },
           }
-          // else keep polling
+        );
+
+        const text = await res.text().catch(() => "");
+        if (res.ok) {
+          try {
+            finalResult = JSON.parse(text || "{}");
+          } catch {
+            finalResult = {};
+          }
+
+          const statusStr = String(finalResult?.status ?? "").toLowerCase();
+          if (statusStr === "completed" || statusStr === "failed") {
+            console.log(`AI task ${taskId} finished with status=${statusStr}`);
+            break;
+          } else {
+            console.log(
+              `AI task ${taskId} status=${
+                statusStr || "unknown"
+              } (attempt ${attempt}) — waiting`
+            );
+          }
         } else {
-          const txt = await res.text().catch(() => "");
-          console.warn(
-            `AI results check attempt ${attempt}: ${res.status} ${txt}`
+          // often AI returns 400 {"detail":"Evaluation not completed..."} -> treat as retriable
+          let parsedBody: any = null;
+          try {
+            parsedBody = JSON.parse(text || "");
+          } catch {
+            parsedBody = { raw: text };
+          }
+          const detail = String(
+            parsedBody?.detail ?? parsedBody?.message ?? ""
           );
+          if (res.status === 400 && /evaluation not completed/i.test(detail)) {
+            console.log(`AI results not ready (attempt ${attempt}): ${detail}`);
+            // continue polling
+          } else {
+            lastPollError = { status: res.status, body: parsedBody };
+            console.warn(
+              `AI results check attempt ${attempt} returned status=${res.status} body=`,
+              parsedBody
+            );
+          }
         }
-      } catch (err) {
-        console.warn("Error polling AI results:", err);
+      } catch (err: any) {
+        lastPollError = err;
+        console.warn(
+          `Error polling AI results attempt ${attempt}:`,
+          err?.message ?? err
+        );
       }
-      await new Promise((r) => setTimeout(r, intervalMs));
+
+      await new Promise((r) => setTimeout(r, pollIntervalMs));
     }
 
     if (!finalResult) {
+      console.error(
+        "AI polling timed out or never returned completed/failed",
+        lastPollError
+      );
       await storage.updateRecording(recordingId, {
         status: "closed",
         ai_score: null,
-        ai_result: { error: "AI result polling timed out" },
+        ai_result: {
+          error: "AI polling timed out",
+          detail: String(lastPollError?.message ?? lastPollError),
+        },
       });
       return;
     }
 
-    const results = Array.isArray(finalResult.results)
+    // compute ai_score (highest final_score if present)
+    const resultsArray = Array.isArray(finalResult.results)
       ? finalResult.results
       : [];
-    // derive ai_score (highest final_score). You can change to average if desired.
     const ai_score =
-      results.length > 0
-        ? results.reduce((max: number, r: any) => {
-            const v = Number(r.final_score ?? 0);
-            return isFinite(v) ? Math.max(max, v) : max;
-          }, 0)
+      resultsArray.length > 0
+        ? resultsArray.reduce(
+            (max: number, r: any) => Math.max(max, Number(r.final_score ?? 0)),
+            0
+          )
         : null;
-
-    // Update storage as 'scored' or 'closed' based on finalResult.status
     const finalStatus =
-      finalResult?.status === "completed" ? "scored" : "closed";
+      String(finalResult.status ?? "").toLowerCase() === "completed"
+        ? "scored"
+        : "closed";
+
     await storage.updateRecording(recordingId, {
       status: finalStatus,
       ai_score,
       ai_result: finalResult,
     });
-  } catch (err) {
-    console.error("sendFileToAiAndUpdateRecording error:", err);
+
+    console.log(
+      `Recording ${recordingId} updated with status=${finalStatus} ai_score=${ai_score}`
+    );
+  } catch (err: any) {
+    console.error("sendMp3ToAiAndUpdateRecording uncaught error:", err);
     await storage.updateRecording(recordingId, {
       status: "closed",
       ai_score: null,
-      ai_result: { error: err instanceof Error ? err.message : String(err) },
+      ai_result: { error: String(err?.message ?? err) },
     });
   }
 }
 
 export async function registerRoutes(app: Express): Promise<Server> {
-  // CORS middleware
+  // CORS
   app.use((req, res, next) => {
     res.header("Access-Control-Allow-Origin", "*");
     res.header("Access-Control-Allow-Methods", "GET,PUT,POST,DELETE,OPTIONS");
@@ -181,72 +321,121 @@ export async function registerRoutes(app: Express): Promise<Server> {
     else next();
   });
 
-  // Serve static uploads (express will set content-type based on extension)
+  // Serve uploads (express will set content-type based on file extension)
   app.use("/uploads", express.static(uploadDir));
 
-  // auth/login (same as before)
+  // simple auth endpoint (unchanged)
   app.post("/api/auth/login", async (req, res) => {
     try {
       const { email } = req.body;
       if (!email) return res.status(400).json({ message: "Email is required" });
-
       let user = await storage.getUserByEmail(email);
       if (!user) user = await storage.createUser({ email });
-      res.json({ user });
-    } catch (error) {
-      res.status(500).json({
-        message: "Login failed",
-        error: error instanceof Error ? error.message : "Unknown error",
-      });
+      return res.json({ user });
+    } catch (err) {
+      console.error("login error:", err);
+      return res
+        .status(500)
+        .json({
+          message: "Login failed",
+          error: String((err as any)?.message ?? err),
+        });
     }
   });
 
-  // Upload recording - preserves extension so audio_url is usable
+  /**
+   * POST /api/recordings
+   * - saves uploaded file (preserve extension)
+   * - converts to MP3 (mono 16k)
+   * - create recording with audio_url pointing to the mp3 file
+   * - start background sendMp3ToAiAndUpdateRecording(mp3Path, recordingId)
+   */
   app.post("/api/recordings", upload.single("audio"), async (req, res) => {
     try {
       const { email } = req.body;
-      if (!email || !req.file)
+      if (!email || !req.file) {
         return res
           .status(400)
           .json({ message: "Email and audio file are required" });
+      }
 
       const portalStatus = await storage.getPortalStatus();
-      if (!portalStatus.is_open)
+      if (!portalStatus.is_open) {
         return res.status(403).json({ message: "Audition portal is closed" });
+      }
 
       const existing = await storage.getRecordingsByEmail(email);
-      if (existing.length > 0)
+      if (existing.length > 0) {
         return res
           .status(400)
           .json({ message: "User already has a recording submitted" });
+      }
 
-      // Use the saved filename (which includes extension)
-      const savedFilename = (req.file as any).filename as string;
-      const audioUrl = `/uploads/${savedFilename}`;
+      const savedFilename = (req.file as any).filename as string; // includes ext
+      const savedPath = (req.file as any).path as string; // full path
+      const mp3Filename = `${path.parse(savedFilename).name}.mp3`; // same base, .mp3
+      const mp3Path = path.join(uploadDir, mp3Filename);
+      const mp3Url = `/uploads/${mp3Filename}`;
 
-      // createRecording in MemStorage should set created_at: Date and ai_score: null by default
+      // Convert to mp3 (async) - do before creating recording so audio_url points to mp3
+      try {
+        await convertToMp3(savedPath, mp3Path);
+        // optionally remove original file to save space:
+        try {
+          if (fs.existsSync(savedPath) && savedPath !== mp3Path) {
+            fs.unlinkSync(savedPath);
+          }
+        } catch (e) {
+          console.warn("failed to remove original upload:", e);
+        }
+      } catch (convErr) {
+        console.error("Audio conversion to mp3 failed:", convErr);
+        // create recording but mark closed and store ai_result error
+        const recordingErr = await storage.createRecording({
+          email,
+          audio_url: `/uploads/${savedFilename}`, // fallback to original file
+          status: "closed",
+        });
+        await storage.updateRecording(recordingErr.id, {
+          ai_score: null,
+          ai_result: {
+            error: "Audio conversion to mp3 failed",
+            detail: String((convErr as any)?.message ?? convErr),
+          },
+        });
+        return res
+          .status(500)
+          .json({
+            message: "Audio conversion failed",
+            error: String((convErr as any)?.message ?? convErr),
+          });
+      }
+
+      // create recording (audio_url points to mp3)
       const recording = await storage.createRecording({
         email,
-        audio_url: audioUrl,
+        audio_url: mp3Url,
         status: "pending",
       });
 
-      // start background processing (fire-and-forget)
-      const localFilePath = (req.file as any).path as string;
+      // Fire-and-forget: send mp3 to AI and update recording
       setImmediate(() => {
-        void sendFileToAiAndUpdateRecording(localFilePath, recording.id);
+        void sendMp3ToAiAndUpdateRecording(mp3Path, recording.id);
       });
 
       return res.json({ recording });
-    } catch (error) {
-      return res.status(500).json({
-        message: "Recording upload failed",
-        error: error instanceof Error ? error.message : "Unknown error",
-      });
+    } catch (err) {
+      console.error("POST /api/recordings error:", err);
+      return res
+        .status(500)
+        .json({
+          message: "Recording upload failed",
+          error: String((err as any)?.message ?? err),
+        });
     }
   });
 
-  // GET single recording (frontend polls this)
+  // GET single recording (for frontend polling)
   app.get("/api/recordings/:id", async (req, res) => {
     try {
       const id = req.params.id;
@@ -254,11 +443,14 @@ export async function registerRoutes(app: Express): Promise<Server> {
       if (!recording)
         return res.status(404).json({ message: "Recording not found" });
       return res.json({ recording });
-    } catch (error) {
-      return res.status(500).json({
-        message: "Failed to fetch recording",
-        error: error instanceof Error ? error.message : "Unknown error",
-      });
+    } catch (err) {
+      console.error("GET /api/recordings/:id error:", err);
+      return res
+        .status(500)
+        .json({
+          message: "Failed to fetch recording",
+          error: String((err as any)?.message ?? err),
+        });
     }
   });
 
@@ -267,41 +459,47 @@ export async function registerRoutes(app: Express): Promise<Server> {
     try {
       const recordings = await storage.getAllRecordings();
       return res.json({ recordings });
-    } catch (error) {
-      return res.status(500).json({
-        message: "Failed to fetch recordings",
-        error: error instanceof Error ? error.message : "Unknown error",
-      });
+    } catch (err) {
+      console.error("GET /api/recordings error:", err);
+      return res
+        .status(500)
+        .json({
+          message: "Failed to fetch recordings",
+          error: String((err as any)?.message ?? err),
+        });
     }
   });
 
-  // Close audition portal -> simulated scoring
+  // close audition (simulate scoring unmatched)
   app.post("/api/close_audition", async (req, res) => {
     try {
       await storage.setPortalStatus({ is_open: false });
       const recordings = await storage.getAllRecordings();
-      const scoringPromises = recordings
+      const scoring = recordings
         .filter((r) => r.ai_score === null)
-        .map(async (rec) => {
-          const aiScore = Math.floor(Math.random() * 101);
-          return storage.updateRecording(rec.id, {
-            ai_score: aiScore,
+        .map((r) => {
+          const s = Math.floor(Math.random() * 101);
+          return storage.updateRecording(r.id, {
+            ai_score: s,
             status: "scored",
           });
         });
-      await Promise.all(scoringPromises);
+      await Promise.all(scoring);
       return res.json({
         message: "Audition portal closed and AI scoring completed",
       });
-    } catch (error) {
-      return res.status(500).json({
-        message: "Failed to close audition portal",
-        error: error instanceof Error ? error.message : "Unknown error",
-      });
+    } catch (err) {
+      console.error("close_audition error:", err);
+      return res
+        .status(500)
+        .json({
+          message: "Failed to close audition",
+          error: String((err as any)?.message ?? err),
+        });
     }
   });
 
-  // status, leaderboard, portal-status (unchanged)
+  // status, leaderboard, portal-status unchanged
   app.get("/api/status", async (req, res) => {
     try {
       const { email } = req.query;
@@ -309,11 +507,14 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const recordings = await storage.getRecordingsByEmail(email as string);
       const recording = recordings[0] || null;
       return res.json({ recording, has_submitted: !!recording });
-    } catch (error) {
-      return res.status(500).json({
-        message: "Failed to get status",
-        error: error instanceof Error ? error.message : "Unknown error",
-      });
+    } catch (err) {
+      console.error("GET /api/status error:", err);
+      return res
+        .status(500)
+        .json({
+          message: "Failed to get status",
+          error: String((err as any)?.message ?? err),
+        });
     }
   });
 
@@ -324,11 +525,14 @@ export async function registerRoutes(app: Express): Promise<Server> {
         .filter((r) => r.status === "scored" && r.ai_score !== null)
         .sort((a, b) => (b.ai_score || 0) - (a.ai_score || 0));
       return res.json({ leaderboard: scored });
-    } catch (error) {
-      return res.status(500).json({
-        message: "Failed to fetch leaderboard",
-        error: error instanceof Error ? error.message : "Unknown error",
-      });
+    } catch (err) {
+      console.error("GET /api/leaderboard error:", err);
+      return res
+        .status(500)
+        .json({
+          message: "Failed to get leaderboard",
+          error: String((err as any)?.message ?? err),
+        });
     }
   });
 
@@ -336,11 +540,14 @@ export async function registerRoutes(app: Express): Promise<Server> {
     try {
       const status = await storage.getPortalStatus();
       return res.json(status);
-    } catch (error) {
-      return res.status(500).json({
-        message: "Failed to get portal status",
-        error: error instanceof Error ? error.message : "Unknown error",
-      });
+    } catch (err) {
+      console.error("GET /api/portal-status error:", err);
+      return res
+        .status(500)
+        .json({
+          message: "Failed to get portal status",
+          error: String((err as any)?.message ?? err),
+        });
     }
   });
 
