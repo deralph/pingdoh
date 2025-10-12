@@ -1,9 +1,10 @@
-import { useState, useRef, useCallback } from "react";
+// components/AudioRecorder.tsx
+import { useState, useRef, useCallback, useEffect } from "react";
 import { Button } from "@/components/ui/button";
 import { useToast } from "@/hooks/use-toast";
 import { api } from "@/lib/api";
-import { useAuth } from "@/lib/auth";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useAuth } from "@/lib/auth";
 
 export function AudioRecorder() {
   const [isRecording, setIsRecording] = useState(false);
@@ -12,14 +13,32 @@ export function AudioRecorder() {
   const [audioUrl, setAudioUrl] = useState<string | null>(null);
 
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const timerRef = useRef<NodeJS.Timeout | null>(null);
+  const timerRef = useRef<number | null>(null); // use number for browser setInterval
   const streamRef = useRef<MediaStream | null>(null);
 
   const { toast } = useToast();
   const { user } = useAuth();
   const queryClient = useQueryClient();
 
-  // Inside AudioRecorder component - replace uploadMutation and submitRecording with below:
+  // Ensure timers/streams cleaned up on unmount
+  useEffect(() => {
+    return () => {
+      // stop media recorder if still active
+      try {
+        if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
+          mediaRecorderRef.current.stop();
+        }
+      } catch {}
+      if (timerRef.current) {
+        window.clearInterval(timerRef.current);
+        timerRef.current = null;
+      }
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach((t) => t.stop());
+        streamRef.current = null;
+      }
+    };
+  }, []);
 
   const uploadMutation = useMutation({
     mutationFn: async (blob: Blob) => {
@@ -27,52 +46,46 @@ export function AudioRecorder() {
       return api.uploadRecording(user.email, blob);
     },
     onSuccess: (data) => {
-      // data.recording is the created recording
       const recording = data.recording;
       toast({
         title: "Uploaded",
-        description:
-          "Your recording was uploaded. AI is evaluating — we'll notify you when it's done.",
+        description: "Your recording was uploaded. AI will evaluate it shortly.",
       });
 
-      // optimistic UI updates + invalidate lists
       queryClient.invalidateQueries({ queryKey: ["/api/status"] });
       queryClient.invalidateQueries({ queryKey: ["/api/leaderboard"] });
 
-      // start a fire-and-forget waiter to poll for AI result
+      // Fire-and-forget poll for ai result (do not block)
       (async () => {
         try {
-          const final = await api.waitForAiResult(recording.id, {
-            interval: 2000,
-            timeout: 180000,
-          });
-          // final contains ai_score and ai_result
+          const final = await api.waitForAiResult(recording.id, { interval: 2000, timeout: 180000 });
           toast({
             title: "Evaluation complete",
             description: `Your recording was scored: ${final.ai_score}`,
           });
-          // refresh relevant queries
           queryClient.invalidateQueries({ queryKey: ["/api/status"] });
           queryClient.invalidateQueries({ queryKey: ["/api/leaderboard"] });
-        } catch (err) {
+        } catch (err: any) {
           toast({
-            title: "Evaluation failed",
-            description:
-              (err as Error).message || "AI evaluation failed or timed out",
+            title: "Evaluation error",
+            description: err?.message ?? "AI evaluation failed or timed out",
             variant: "destructive",
           });
         }
       })();
 
-      // reset local UI
+      // reset UI
       setAudioBlob(null);
-      setAudioUrl(null);
+      if (audioUrl) {
+        URL.revokeObjectURL(audioUrl);
+        setAudioUrl(null);
+      }
       setRecordingTime(0);
     },
-    onError: (error: Error) => {
+    onError: (err: any) => {
       toast({
-        title: "Upload Failed",
-        description: error.message,
+        title: "Upload failed",
+        description: err?.message ?? "Upload failed",
         variant: "destructive",
       });
     },
@@ -83,235 +96,147 @@ export function AudioRecorder() {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       streamRef.current = stream;
 
+      // Set up MediaRecorder and handlers before starting
       const mediaRecorder = new MediaRecorder(stream);
       mediaRecorderRef.current = mediaRecorder;
-
       const chunks: Blob[] = [];
 
-      mediaRecorder.ondataavailable = (event) => {
-        chunks.push(event.data);
+      mediaRecorder.ondataavailable = (ev: BlobEvent) => {
+        if (ev.data && ev.data.size > 0) chunks.push(ev.data);
       };
 
       mediaRecorder.onstop = () => {
+        // create blob and URL
         const blob = new Blob(chunks, { type: "audio/webm" });
         setAudioBlob(blob);
-        setAudioUrl(URL.createObjectURL(blob));
 
-        // Clean up stream
-        if (streamRef.current) {
-          streamRef.current.getTracks().forEach((track) => track.stop());
+        // revoke old URL if any
+        if (audioUrl) {
+          URL.revokeObjectURL(audioUrl);
         }
+        const url = URL.createObjectURL(blob);
+        setAudioUrl(url);
+
+        // stop stream tracks if still active
+        if (streamRef.current) {
+          streamRef.current.getTracks().forEach((t) => t.stop());
+          streamRef.current = null;
+        }
+
+        // clear timer (defensive - also cleared on stopRecording)
+        if (timerRef.current) {
+          window.clearInterval(timerRef.current);
+          timerRef.current = null;
+        }
+
+        setIsRecording(false);
       };
 
+      // start recording AFTER handlers set
       mediaRecorder.start();
-      setIsRecording(true);
-      setRecordingTime(0);
 
-      // Start timer
-      timerRef.current = setInterval(() => {
+      // start timer using window.setInterval (returns number in browsers)
+      timerRef.current = window.setInterval(() => {
         setRecordingTime((prev) => prev + 1);
       }, 1000);
-    } catch (error) {
+
+      setIsRecording(true);
+      setRecordingTime(0);
+    } catch (err) {
+      console.error("startRecording error", err);
       toast({
-        title: "Recording Failed",
-        description: "Unable to access microphone. Please check permissions.",
+        title: "Recording failed",
+        description: "Unable to access microphone. Check permissions.",
         variant: "destructive",
       });
     }
-  }, [toast]);
+  }, [toast, audioUrl]);
 
   const stopRecording = useCallback(() => {
-    if (mediaRecorderRef.current && isRecording) {
-      mediaRecorderRef.current.stop();
+    try {
+      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
+        mediaRecorderRef.current.stop();
+      }
+    } catch (err) {
+      console.warn("stopRecording error:", err);
+      // still attempt to cleanup
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach((t) => t.stop());
+        streamRef.current = null;
+      }
+      if (mediaRecorderRef.current) {
+        try { mediaRecorderRef.current = null; } catch {}
+      }
       setIsRecording(false);
-
+    } finally {
+      // clear timer if any (defensive)
       if (timerRef.current) {
-        clearInterval(timerRef.current);
+        window.clearInterval(timerRef.current);
         timerRef.current = null;
       }
     }
-  }, [isRecording]);
+  }, []);
 
   const reRecord = useCallback(() => {
     if (audioUrl) {
       URL.revokeObjectURL(audioUrl);
+      setAudioUrl(null);
     }
     setAudioBlob(null);
-    setAudioUrl(null);
     setRecordingTime(0);
   }, [audioUrl]);
+
+  const submitRecording = useCallback(() => {
+    if (!audioBlob) {
+      toast({ title: "No recording", description: "Please record before submitting.", variant: "destructive" });
+      return;
+    }
+    uploadMutation.mutate(audioBlob);
+  }, [audioBlob, uploadMutation, toast]);
 
   const formatTime = (seconds: number) => {
     const mins = Math.floor(seconds / 60);
     const secs = seconds % 60;
-    return `${mins.toString().padStart(2, "0")}:${secs
-      .toString()
-      .padStart(2, "0")}`;
+    return `${String(mins).padStart(2, "0")}:${String(secs).padStart(2, "0")}`;
   };
-
-  const submitRecording = useCallback(() => {
-    if (audioBlob) {
-      uploadMutation.mutate(audioBlob);
-    }
-  }, [audioBlob, uploadMutation]);
 
   return (
     <div className="bg-card rounded-xl shadow-sm border border-border overflow-hidden">
       <div className="p-6 border-b border-border">
-        <h3 className="text-lg font-semibold text-foreground">
-          Record Your Audition
-        </h3>
-        <p className="text-sm text-muted-foreground mt-1">
-          Click the record button to start. You can re-record as many times as
-          needed.
-        </p>
+        <h3 className="text-lg font-semibold text-foreground">Record Your Audition</h3>
+        <p className="text-sm text-muted-foreground mt-1">Click the record button to start. You can re-record as many times as needed.</p>
       </div>
 
       <div className="p-8">
-        {/* Recording Visualizer */}
         <div className="flex justify-center mb-8">
           <div className="relative">
-            <Button
-              size="lg"
-              className="w-24 h-24 rounded-full shadow-lg hover:scale-105 active:scale-95 transition-transform"
-              onClick={isRecording ? stopRecording : startRecording}
-              data-testid="button-record"
-            >
-              {isRecording ? (
-                <svg
-                  className="w-12 h-12"
-                  fill="currentColor"
-                  viewBox="0 0 20 20"
-                >
-                  <path
-                    fillRule="evenodd"
-                    d="M10 18a8 8 0 100-16 8 8 0 000 16zM8 7a1 1 0 00-1 1v4a1 1 0 001 1h4a1 1 0 001-1V8a1 1 0 00-1-1H8z"
-                    clipRule="evenodd"
-                  ></path>
-                </svg>
-              ) : (
-                <svg
-                  className="w-12 h-12"
-                  fill="currentColor"
-                  viewBox="0 0 20 20"
-                >
-                  <path
-                    fillRule="evenodd"
-                    d="M10 18a8 8 0 100-16 8 8 0 000 16zM9.555 7.168A1 1 0 008 8v4a1 1 0 001.555.832l3-2a1 1 0 000-1.664l-3-2z"
-                    clipRule="evenodd"
-                  ></path>
-                </svg>
-              )}
+            <Button size="lg" className="w-24 h-24 rounded-full" onClick={isRecording ? stopRecording : startRecording}>
+              {isRecording ? "Stop" : "Record"}
             </Button>
-
-            {isRecording && (
-              <div className="absolute -top-1 -right-1 w-6 h-6 bg-destructive rounded-full recording-pulse">
-                <span className="absolute inset-0 bg-destructive rounded-full animate-ping"></span>
-              </div>
-            )}
           </div>
         </div>
 
-        {/* Wave Animation */}
-        {isRecording && (
-          <div className="flex justify-center items-center space-x-1 h-16 mb-6">
-            {[...Array(9)].map((_, i) => (
-              <div
-                key={i}
-                className="w-1 bg-primary rounded-full wave-animation"
-                style={{
-                  height: `${20 + (i % 3) * 20}%`,
-                  animationDelay: `${i * 0.1}s`,
-                }}
-              />
-            ))}
-          </div>
-        )}
-
-        {/* Timer Display */}
         <div className="text-center mb-6">
-          <div
-            className="text-4xl font-bold text-foreground font-mono"
-            data-testid="text-recording-time"
-          >
-            {formatTime(recordingTime)}
-          </div>
-          <p className="text-sm text-muted-foreground mt-1">
-            Recording Duration
-          </p>
+          <div className="text-4xl font-bold text-foreground font-mono">{formatTime(recordingTime)}</div>
+          <p className="text-sm text-muted-foreground mt-1">Recording Duration</p>
         </div>
 
-        {/* Control Buttons */}
-        <div className="flex flex-col sm:flex-row gap-3 justify-center">
-          <Button
-            variant="secondary"
-            onClick={reRecord}
-            className="flex items-center justify-center space-x-2"
-            data-testid="button-rerecord"
-          >
-            <svg
-              className="w-5 h-5"
-              fill="none"
-              stroke="currentColor"
-              viewBox="0 0 24 24"
-            >
-              <path
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                strokeWidth="2"
-                d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"
-              ></path>
-            </svg>
-            <span>Re-record</span>
+        <div className="flex gap-3 justify-center mb-6">
+          <Button variant="secondary" onClick={reRecord} disabled={isRecording || !audioBlob}>Re-record</Button>
+          <Button onClick={submitRecording} disabled={!audioBlob || uploadMutation.isPending}>
+            {uploadMutation.isPending ? "Uploading..." : "Submit Recording"}
           </Button>
         </div>
 
-        {/* Audio Preview */}
         {audioUrl && (
           <div className="mt-6 p-4 bg-accent rounded-lg">
             <div className="flex items-center justify-between mb-3">
-              <span className="text-sm font-medium text-accent-foreground">
-                Your Recording
-              </span>
-              <span className="text-xs text-muted-foreground">
-                Ready to submit
-              </span>
+              <span className="text-sm font-medium text-accent-foreground">Your Recording</span>
+              <span className="text-xs text-muted-foreground">Ready to submit</span>
             </div>
-            <audio
-              controls
-              className="w-full"
-              src={audioUrl}
-              data-testid="audio-preview"
-            />
+            <audio controls className="w-full" src={audioUrl} />
           </div>
         )}
-
-        {/* Submit Button */}
-        <div className="mt-6">
-          <Button
-            className="w-full py-4 font-semibold shadow-md flex items-center justify-center space-x-2"
-            onClick={submitRecording}
-            disabled={!audioBlob || uploadMutation.isPending}
-            data-testid="button-submit-recording"
-          >
-            <svg
-              className="w-5 h-5"
-              fill="none"
-              stroke="currentColor"
-              viewBox="0 0 24 24"
-            >
-              <path
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                strokeWidth="2"
-                d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"
-              ></path>
-            </svg>
-            <span>
-              {uploadMutation.isPending ? "Uploading..." : "Submit Recording"}
-            </span>
-          </Button>
-        </div>
       </div>
     </div>
   );

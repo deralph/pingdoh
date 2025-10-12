@@ -1,3 +1,4 @@
+// server/storage.ts
 import {
   type User,
   type InsertUser,
@@ -6,6 +7,8 @@ import {
   type PortalStatus,
 } from "@shared/schema";
 import { randomUUID } from "crypto";
+import fs from "fs";
+import path from "path";
 
 export interface IStorage {
   // Users
@@ -19,6 +22,10 @@ export interface IStorage {
   getAllRecordings(): Promise<Recording[]>;
   createRecording(recording: InsertRecording): Promise<Recording>;
   updateRecording(id: string, updates: Partial<Recording>): Promise<Recording>;
+
+  // extras for restart
+  deleteRecording(id: string): Promise<void>;
+  clearAllRecordings(): Promise<void>;
 
   // Portal Status
   getPortalStatus(): Promise<PortalStatus>;
@@ -46,6 +53,7 @@ export class MemStorage implements IStorage {
     this.users.set(adminId, adminUser);
   }
 
+  // --- Users ---
   async getUser(id: string): Promise<User | undefined> {
     return this.users.get(id);
   }
@@ -66,6 +74,7 @@ export class MemStorage implements IStorage {
     return user;
   }
 
+  // --- Recordings ---
   async getRecording(id: string): Promise<Recording | undefined> {
     return this.recordings.get(id);
   }
@@ -108,6 +117,17 @@ export class MemStorage implements IStorage {
     return updated;
   }
 
+  // new: delete single recording
+  async deleteRecording(id: string): Promise<void> {
+    this.recordings.delete(id);
+  }
+
+  // new: clear all recordings
+  async clearAllRecordings(): Promise<void> {
+    this.recordings.clear();
+  }
+
+  // --- Portal status ---
   async getPortalStatus(): Promise<PortalStatus> {
     return this.portalStatus;
   }

@@ -1,4 +1,4 @@
-// src/lib/api.ts
+// client/src/lib/api.ts
 export type AiFileScore = {
   filename: string;
   pitch: number;
@@ -29,26 +29,15 @@ export type Recording = {
 };
 
 export const api = {
-  uploadRecording: async (
-    email: string,
-    audioBlob: Blob
-  ): Promise<{ recording: Recording }> => {
+  uploadRecording: async (email: string, audioBlob: Blob): Promise<{ recording: Recording }> => {
     const formData = new FormData();
     formData.append("email", email);
     formData.append("audio", audioBlob, "recording.webm");
-
-    const response = await fetch("/api/recordings", {
-      method: "POST",
-      body: formData,
-    });
-
+    const response = await fetch("/api/recordings", { method: "POST", body: formData });
     if (!response.ok) {
-      const err = await response
-        .json()
-        .catch(() => ({ message: "Upload failed" }));
+      const err = await response.json().catch(() => ({ message: "Upload failed" }));
       throw new Error(err.message || "Upload failed");
     }
-
     return (await response.json()) as { recording: Recording };
   },
 
@@ -58,22 +47,13 @@ export const api = {
     return (await resp.json()) as { recording: Recording };
   },
 
-  waitForAiResult: async (
-    recordingId: string,
-    { interval = 2000, timeout = 120000 } = {}
-  ) => {
+  waitForAiResult: async (recordingId: string, { interval = 2000, timeout = 120000 } = {}) => {
     const start = Date.now();
     while (true) {
       const { recording } = await api.getRecording(recordingId);
-      if (recording.ai_score !== null && recording.ai_score !== undefined) {
-        return recording;
-      }
-      if (recording.status === "closed") {
-        throw new Error("AI evaluation failed/closed");
-      }
-      if (Date.now() - start > timeout) {
-        throw new Error("Timed out waiting for AI result");
-      }
+      if (recording.ai_score !== null && recording.ai_score !== undefined) return recording;
+      if (recording.status === "closed") throw new Error("AI evaluation failed/closed");
+      if (Date.now() - start > timeout) throw new Error("Timed out waiting for AI result");
       await new Promise((r) => setTimeout(r, interval));
     }
   },
@@ -87,10 +67,7 @@ export const api = {
   getUserStatus: async (email: string) => {
     const resp = await fetch(`/api/status?email=${encodeURIComponent(email)}`);
     if (!resp.ok) throw new Error("Failed to get status");
-    return (await resp.json()) as {
-      recording: Recording | null;
-      has_submitted: boolean;
-    };
+    return (await resp.json()) as { recording: Recording | null; has_submitted: boolean };
   },
 
   getPortalStatus: async () => {
@@ -102,6 +79,19 @@ export const api = {
   closeAuditionPortal: async () => {
     const resp = await fetch("/api/close_audition", { method: "POST" });
     if (!resp.ok) throw new Error("Failed to close audition");
+    return await resp.json();
+  },
+
+  restartAudition: async (mode: "soft" | "hard") => {
+    const resp = await fetch("/api/restart_audition", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode }),
+    });
+    if (!resp.ok) {
+      const body = await resp.json().catch(() => ({ message: "Restart failed" }));
+      throw new Error(body.message || "Restart failed");
+    }
     return await resp.json();
   },
 

@@ -1,5 +1,5 @@
-// AdminDashboard.tsx
-import { useState } from "react";
+// src/pages/admin-dashboard.tsx
+import React, { useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { api, Recording, AiFileScore } from "@/lib/api";
 import { Navbar } from "@/components/navbar";
@@ -15,23 +15,26 @@ import {
 import {
   Dialog,
   DialogContent,
-  DialogDescription,
   DialogFooter,
   DialogHeader,
   DialogTitle,
   DialogTrigger,
+  DialogDescription,
 } from "@/components/ui/dialog";
 import { useToast } from "@/hooks/use-toast";
 
-export default function AdminDashboard() {
+export default function AdminDashboard(): JSX.Element {
   const [searchTerm, setSearchTerm] = useState("");
-  const [statusFilter, setStatusFilter] = useState("all");
+  const [statusFilter, setStatusFilter] = useState<string>("all");
   const [showCloseDialog, setShowCloseDialog] = useState(false);
+  const [showRestartDialog, setShowRestartDialog] = useState(false);
+  const [restartMode, setRestartMode] = useState<"soft" | "hard">("soft");
   const [expandedId, setExpandedId] = useState<string | null>(null);
 
   const { toast } = useToast();
   const queryClient = useQueryClient();
 
+  // Queries
   const { data: recordingsData, isLoading } = useQuery({
     queryKey: ["/api/recordings"],
     queryFn: api.getAllRecordings,
@@ -42,8 +45,9 @@ export default function AdminDashboard() {
     queryFn: api.getPortalStatus,
   });
 
+  // Mutations: use object-style to avoid runtime signature mismatch
   const closePortalMutation = useMutation({
-    mutationFn: api.closeAuditionPortal,
+    mutationFn: async () => api.closeAuditionPortal(),
     onSuccess: () => {
       toast({
         title: "Portal Closed",
@@ -55,18 +59,43 @@ export default function AdminDashboard() {
       queryClient.invalidateQueries({ queryKey: ["/api/leaderboard"] });
       setShowCloseDialog(false);
     },
-    onError: (error: Error) => {
+    onError: (error: unknown) => {
+      const message =
+        error instanceof Error ? error.message : "Failed to close portal";
       toast({
         title: "Error",
-        description: error.message,
+        description: message,
         variant: "destructive",
       });
     },
   });
 
-  const recordings = recordingsData?.recordings || [];
+  const restartMutation = useMutation({
+    mutationFn: async (mode: "soft" | "hard") => api.restartAudition(mode),
+    onSuccess: () => {
+      toast({
+        title: "Restarted",
+        description: `Audition restarted (${restartMode}).`,
+      });
+      queryClient.invalidateQueries({ queryKey: ["/api/portal-status"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/recordings"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/leaderboard"] });
+      setShowRestartDialog(false);
+    },
+    onError: (error: unknown) => {
+      const message =
+        error instanceof Error ? error.message : "Failed to restart audition";
+      toast({
+        title: "Restart failed",
+        description: message,
+        variant: "destructive",
+      });
+    },
+  });
 
-  const filteredRecordings = recordings.filter((recording: Recording) => {
+  const recordings: Recording[] = recordingsData?.recordings ?? [];
+
+  const filteredRecordings = recordings.filter((recording) => {
     const matchesSearch = recording.email
       .toLowerCase()
       .includes(searchTerm.toLowerCase());
@@ -77,27 +106,26 @@ export default function AdminDashboard() {
 
   const stats = {
     total: recordings.length,
-    scored: recordings.filter((r: Recording) => r.ai_score !== null).length,
-    pending: recordings.filter((r: Recording) => r.ai_score === null).length,
+    scored: recordings.filter((r) => r.ai_score !== null).length,
+    pending: recordings.filter((r) => r.ai_score === null).length,
     averageScore:
-      recordings
-        .filter((r: Recording) => r.ai_score !== null)
-        .reduce((sum: number, r: Recording) => sum + (r.ai_score || 0), 0) /
-      Math.max(
-        1,
-        recordings.filter((r: Recording) => r.ai_score !== null).length
-      ),
+      recordings.filter((r) => r.ai_score !== null).length > 0
+        ? recordings
+            .filter((r) => r.ai_score !== null)
+            .reduce((sum, r) => sum + (r.ai_score || 0), 0) /
+          recordings.filter((r) => r.ai_score !== null).length
+        : 0,
   };
 
   const getInitials = (email: string) => {
     const parts = email.split("@")[0].split(/[._-]/);
-    return parts
-      .map((p) => p.charAt(0).toUpperCase())
-      .join("")
-      .slice(0, 2);
+    return parts.map((p) => p.charAt(0).toUpperCase()).join("").slice(0, 2);
   };
 
-  const statusMap: Record<string, { class: string; text: string }> = {
+  const statusMap: Record<
+    string,
+    { class: string; text: string }
+  > = {
     pending: { class: "bg-warning/10 text-warning", text: "Pending" },
     under_review: { class: "bg-primary/10 text-primary", text: "Under Review" },
     scored: { class: "bg-success/10 text-success", text: "Scored" },
@@ -113,10 +141,16 @@ export default function AdminDashboard() {
       minute: "2-digit",
     });
 
-  const handleClosePortal = () => closePortalMutation.mutate();
+  const handleClosePortal = () => {
+    closePortalMutation.mutate();
+  };
+
+  const handleRestart = () => {
+    restartMutation.mutate(restartMode);
+  };
+
   const isPortalOpen = portalStatus?.is_open !== false;
 
-  // Toggle expand panel
   const toggleExpand = (id: string) =>
     setExpandedId((prev) => (prev === id ? null : id));
 
@@ -126,7 +160,7 @@ export default function AdminDashboard() {
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
         {/* Header */}
         <div className="bg-gradient-to-r from-destructive/10 to-primary/10 rounded-xl p-6 border border-border mb-6">
-          <div className="flex flex-wrap items-center justify-between">
+          <div className="flex items-center justify-between">
             <div>
               <h2 className="text-2xl font-bold text-foreground">
                 Admin Dashboard
@@ -136,45 +170,85 @@ export default function AdminDashboard() {
               </p>
             </div>
 
-            {isPortalOpen && (
-              <Dialog open={showCloseDialog} onOpenChange={setShowCloseDialog}>
+            <div className="flex items-center space-x-3">
+              {isPortalOpen && (
+                <Dialog open={showCloseDialog} onOpenChange={setShowCloseDialog}>
+                  <DialogTrigger asChild>
+                    <Button variant="destructive" size="lg" className="shadow-md font-semibold">
+                      Close Audition Portal
+                    </Button>
+                  </DialogTrigger>
+                  <DialogContent>
+                    <DialogHeader>
+                      <DialogTitle>Close Audition Portal?</DialogTitle>
+                      <DialogDescription>
+                        Closing will prevent further submissions and trigger AI scoring for all submissions.
+                      </DialogDescription>
+                    </DialogHeader>
+                    <DialogFooter>
+                      <Button variant="outline" onClick={() => setShowCloseDialog(false)}>
+                        Cancel
+                      </Button>
+                      <Button
+                        variant="destructive"
+                        onClick={handleClosePortal}
+                        disabled={closePortalMutation.isLoading}
+                      >
+                        {closePortalMutation.isLoading ? "Closing..." : "Yes, Close Portal"}
+                      </Button>
+                    </DialogFooter>
+                  </DialogContent>
+                </Dialog>
+              )}
+
+              {/* Restart dialog */}
+              <Dialog open={showRestartDialog} onOpenChange={setShowRestartDialog}>
                 <DialogTrigger asChild>
-                  <Button
-                    variant="destructive"
-                    size="lg"
-                    className="shadow-md font-semibold"
-                  >
-                    Close Audition Portal
-                  </Button>
+                  <Button variant="secondary">Restart Audition</Button>
                 </DialogTrigger>
                 <DialogContent>
                   <DialogHeader>
-                    <DialogTitle>Close Audition Portal?</DialogTitle>
+                    <DialogTitle>Restart Audition</DialogTitle>
                     <DialogDescription>
-                      Closing will prevent further submissions and trigger AI
-                      scoring for all submissions.
+                      Choose how to restart. Soft keeps uploaded files but resets status. Hard deletes all recordings & files.
                     </DialogDescription>
                   </DialogHeader>
+
+                  <div className="p-4 space-y-3">
+                    <label className="flex items-center space-x-2">
+                      <input
+                        type="radio"
+                        name="restartMode"
+                        value="soft"
+                        checked={restartMode === "soft"}
+                        onChange={() => setRestartMode("soft")}
+                      />
+                      <span className="ml-2">Soft restart — keep uploaded files, reset submissions to pending</span>
+                    </label>
+
+                    <label className="flex items-center space-x-2">
+                      <input
+                        type="radio"
+                        name="restartMode"
+                        value="hard"
+                        checked={restartMode === "hard"}
+                        onChange={() => setRestartMode("hard")}
+                      />
+                      <span className="ml-2">Hard restart — delete all recordings and uploaded files</span>
+                    </label>
+                  </div>
+
                   <DialogFooter>
-                    <Button
-                      variant="outline"
-                      onClick={() => setShowCloseDialog(false)}
-                    >
+                    <Button variant="outline" onClick={() => setShowRestartDialog(false)}>
                       Cancel
                     </Button>
-                    <Button
-                      variant="destructive"
-                      onClick={handleClosePortal}
-                      disabled={closePortalMutation.isPending}
-                    >
-                      {closePortalMutation.isPending
-                        ? "Closing..."
-                        : "Yes, Close Portal"}
+                    <Button variant="destructive" onClick={handleRestart} disabled={restartMutation.isLoading}>
+                      {restartMutation.isLoading ? "Restarting..." : `Restart (${restartMode})`}
                     </Button>
                   </DialogFooter>
                 </DialogContent>
               </Dialog>
-            )}
+            </div>
           </div>
         </div>
 
@@ -186,22 +260,17 @@ export default function AdminDashboard() {
           </div>
           <div className="bg-card rounded-lg p-5">
             <p className="text-sm text-muted-foreground">Scored</p>
-            <p className="text-3xl font-bold text-success mt-2">
-              {stats.scored}
-            </p>
+            <p className="text-3xl font-bold text-success mt-2">{stats.scored}</p>
           </div>
           <div className="bg-card rounded-lg p-5">
             <p className="text-sm text-muted-foreground">Pending</p>
-            <p className="text-3xl font-bold text-warning mt-2">
-              {stats.pending}
-            </p>
+            <p className="text-3xl font-bold text-warning mt-2">{stats.pending}</p>
           </div>
           <div className="bg-card rounded-lg p-5">
             <p className="text-sm text-muted-foreground">Avg Score</p>
             <p className="text-3xl font-bold mt-2">
-              {stats.scored > 0
-                ? Math.round(stats.averageScore * 10) / 10
-                : "--"}
+              {stats.scored > 0 ? (stats.averageScore * 100).toFixed(2)+" %" : "--"}
+
             </p>
           </div>
         </div>
@@ -211,9 +280,7 @@ export default function AdminDashboard() {
           <div className="p-6 border-b border-border flex items-center justify-between">
             <div>
               <h3 className="text-lg font-semibold">All Submissions</h3>
-              <p className="text-sm text-muted-foreground mt-1">
-                View and manage contestant recordings
-              </p>
+              <p className="text-sm text-muted-foreground mt-1">View and manage contestant recordings</p>
             </div>
 
             <div className="flex items-center space-x-3">
@@ -223,10 +290,8 @@ export default function AdminDashboard() {
                 onChange={(e) => setSearchTerm(e.target.value)}
                 className="pl-10"
               />
-              <Select value={statusFilter} onValueChange={setStatusFilter}>
-                <SelectTrigger className="w-32">
-                  <SelectValue />
-                </SelectTrigger>
+              <Select value={statusFilter} onValueChange={(val) => setStatusFilter(val)}>
+                <SelectTrigger className="w-32"><SelectValue /></SelectTrigger>
                 <SelectContent>
                   <SelectItem value="all">All</SelectItem>
                   <SelectItem value="pending">Pending</SelectItem>
@@ -242,253 +307,117 @@ export default function AdminDashboard() {
             <table className="w-full">
               <thead className="bg-muted/50">
                 <tr>
-                  <th className="px-6 py-3 text-left text-xs font-semibold text-muted-foreground">
-                    Contestant
-                  </th>
-                  <th className="px-6 py-3 text-left text-xs font-semibold text-muted-foreground">
-                    Submitted At
-                  </th>
-                  <th className="px-6 py-3 text-left text-xs font-semibold text-muted-foreground">
-                    Recording
-                  </th>
-                  <th className="px-6 py-3 text-left text-xs font-semibold text-muted-foreground">
-                    Status
-                  </th>
-                  <th className="px-6 py-3 text-center text-xs font-semibold text-muted-foreground">
-                    AI Score
-                  </th>
-                  <th className="px-6 py-3 text-center text-xs font-semibold text-muted-foreground">
-                    Details
-                  </th>
+                  <th className="px-6 py-3 text-left text-xs font-semibold text-muted-foreground">Contestant</th>
+                  <th className="px-6 py-3 text-left text-xs font-semibold text-muted-foreground">Submitted At</th>
+                  <th className="px-6 py-3 text-left text-xs font-semibold text-muted-foreground">Recording</th>
+                  <th className="px-6 py-3 text-left text-xs font-semibold text-muted-foreground">Status</th>
+                  <th className="px-6 py-3 text-center text-xs font-semibold text-muted-foreground">AI Score</th>
+                  <th className="px-6 py-3 text-center text-xs font-semibold text-muted-foreground">Details</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-border">
                 {isLoading ? (
-                  <tr>
-                    <td
-                      colSpan={6}
-                      className="px-6 py-8 text-center text-muted-foreground"
-                    >
-                      Loading submissions...
-                    </td>
-                  </tr>
+                  <tr><td colSpan={6} className="px-6 py-8 text-center text-muted-foreground">Loading submissions...</td></tr>
                 ) : filteredRecordings.length === 0 ? (
-                  <tr>
-                    <td
-                      colSpan={6}
-                      className="px-6 py-8 text-center text-muted-foreground"
-                    >
-                      No submissions
-                    </td>
-                  </tr>
+                  <tr><td colSpan={6} className="px-6 py-8 text-center text-muted-foreground">No submissions</td></tr>
                 ) : (
-                  filteredRecordings.map(
-                    (recording: Recording, idx: number) => {
-                      const statusCfg =
-                        statusMap[recording.status] || statusMap.pending;
-                      const expanded = expandedId === recording.id;
+                  filteredRecordings.map((recording: Recording) => {
+                    const statusCfg = statusMap[recording.status] || statusMap.pending;
+                    const expanded = expandedId === recording.id;
+                    return (
+                      <React.Fragment key={recording.id}>
+                        <tr className="hover:bg-muted/30 transition-colors">
+                          <td className="px-6 py-4">
+                            <div className="flex items-center space-x-3">
+                              <div className="w-10 h-10 bg-primary/10 rounded-full flex items-center justify-center">
+                                <span className="text-primary font-semibold">{getInitials(recording.email)}</span>
+                              </div>
+                              <div>
+                                <p className="font-medium text-foreground">{recording.email}</p>
+                                <p className="text-xs text-muted-foreground">ID: {recording.id.slice(0, 8)}</p>
+                              </div>
+                            </div>
+                          </td>
 
-                      return (
-                        <tbody key={recording.id}>
-                          <tr className="hover:bg-muted/30 transition-colors">
-                            <td className="px-6 py-4">
-                              <div className="flex items-center space-x-3">
-                                <div className="w-10 h-10 bg-primary/10 rounded-full flex items-center justify-center">
-                                  <span className="text-primary font-semibold">
-                                    {getInitials(recording.email)}
-                                  </span>
-                                </div>
+                          <td className="px-6 py-4 text-sm text-muted-foreground">{formatDate(recording.created_at)}</td>
+
+                          <td className="px-6 py-4">
+                            <audio controls preload="none" src={recording.audio_url} className="w-64" />
+                          </td>
+
+                          <td className="px-6 py-4">
+                            <span className={`px-3 py-1 text-xs font-medium rounded-full ${statusCfg.class}`}>{statusCfg.text}</span>
+                          </td>
+
+                          <td className="px-6 py-4 text-center">
+                            <span className={`text-2xl font-bold ${recording.ai_score !== null ? "text-foreground" : "text-muted-foreground"}`}>
+                              {recording.ai_score !== null ? (recording.ai_score* 100).toFixed(2)+" %" : "--"}
+                            </span>
+                          </td>
+
+                          <td className="px-6 py-4 text-center">
+                            <Button size="sm" onClick={() => toggleExpand(recording.id)}>{expanded ? "Hide" : "Details"}</Button>
+                          </td>
+                        </tr>
+
+                        {expanded && (
+                          <tr>
+                            <td colSpan={6} className="bg-muted/5 p-4">
+                              <div className="space-y-4">
                                 <div>
-                                  <p className="font-medium text-foreground">
-                                    {recording.email}
-                                  </p>
-                                  <p className="text-xs text-muted-foreground">
-                                    ID: {recording.id.slice(0, 8)}
-                                  </p>
+                                  <h4 className="text-sm font-semibold mb-2">AI Evaluation</h4>
+                                  {recording.ai_result ? (
+                                    <>
+                                      <p className="text-xs text-muted-foreground mb-2">Status: {String(recording.ai_result.status)}</p>
+
+                                      {Array.isArray(recording.ai_result.results) && recording.ai_result.results.length > 0 ? (
+                                        <div className="overflow-auto border rounded">
+                                          <table className="w-full text-sm">
+                                            <thead className="bg-muted/30">
+                                              <tr>
+                                                <th className="px-3 py-2 text-left">File</th>
+                                                <th className="px-3 py-2 text-center">Pitch</th>
+                                                <th className="px-3 py-2 text-center">Rhythm</th>
+                                                <th className="px-3 py-2 text-center">Tone</th>
+                                                <th className="px-3 py-2 text-center">Expression</th>
+                                                <th className="px-3 py-2 text-center">Consistency</th>
+                                                <th className="px-3 py-2 text-center">Final</th>
+                                                <th className="px-3 py-2 text-center">Rank</th>
+                                              </tr>
+                                            </thead>
+                                            <tbody>
+                                              {recording.ai_result.results!.map((r: AiFileScore, i: number) => (
+                                                <tr key={i} className="border-t">
+                                                  <td className="px-3 py-2">{r.filename}</td>
+                                                  <td className="px-3 py-2 text-center">{(r.pitch * 100).toFixed(2)}%</td>
+                                                  <td className="px-3 py-2 text-center">{(r.rhythm * 100).toFixed(2)}%</td>
+                                                  <td className="px-3 py-2 text-center">{(r.tone * 100).toFixed(2)}%</td>
+                                                  <td className="px-3 py-2 text-center">{(r.expression * 100).toFixed(2)}%</td>
+                                                  <td className="px-3 py-2 text-center">{(r.consistency * 100).toFixed(2)}%</td>
+                                                  <td className="px-3 py-2 text-center font-bold">{(r.final_score * 100).toFixed(2)}%</td>
+                                                  <td className="px-3 py-2 text-center">{r.rank ?? "--"}</td>
+                                                </tr>
+                                              ))}
+                                            </tbody>
+                                          </table>
+                                        </div>
+                                      ) : (
+                                        <p className="text-sm text-muted-foreground">No per-file results available.</p>
+                                      )}
+
+                                      {recording.ai_result.message && <p className="text-xs text-muted-foreground mt-2">Message: {recording.ai_result.message}</p>}
+                                    </>
+                                  ) : (
+                                    <p className="text-sm text-muted-foreground">AI result not available yet.</p>
+                                  )}
                                 </div>
                               </div>
                             </td>
-
-                            <td className="px-6 py-4 text-sm text-muted-foreground">
-                              {formatDate(recording.created_at)}
-                            </td>
-
-                            <td className="px-6 py-4">
-                              {/* Inline audio player */}
-                              <audio
-                                controls
-                                preload="none"
-                                src={recording.audio_url}
-                                className="w-64"
-                              />
-                            </td>
-
-                            <td className="px-6 py-4">
-                              <span
-                                className={`px-3 py-1 text-xs font-medium rounded-full ${statusCfg.class}`}
-                              >
-                                {statusCfg.text}
-                              </span>
-                            </td>
-
-                            <td className="px-6 py-4 text-center">
-                              <span
-                                className={`text-2xl font-bold ${
-                                  recording.ai_score !== null
-                                    ? "text-foreground"
-                                    : "text-muted-foreground"
-                                }`}
-                              >
-                                {recording.ai_score !== null
-                                  ? recording.ai_score
-                                  : "--"}
-                              </span>
-                            </td>
-
-                            <td className="px-6 py-4 text-center">
-                              <Button
-                                size="sm"
-                                onClick={() => toggleExpand(recording.id)}
-                              >
-                                {expanded ? "Hide" : "Details"}
-                              </Button>
-                            </td>
                           </tr>
-
-                          {/* Expanded details row */}
-                          {expanded && (
-                            <tr>
-                              <td colSpan={6} className="bg-muted/5 p-4">
-                                <div className="space-y-4">
-                                  <div>
-                                    <h4 className="text-sm font-semibold mb-2">
-                                      AI Evaluation
-                                    </h4>
-                                    {recording.ai_result ? (
-                                      <>
-                                        <p className="text-xs text-muted-foreground mb-2">
-                                          Status:{" "}
-                                          {String(recording.ai_result.status)}
-                                        </p>
-                                        {Array.isArray(
-                                          recording.ai_result.results
-                                        ) &&
-                                        recording.ai_result.results.length >
-                                          0 ? (
-                                          <div className="overflow-auto border rounded">
-                                            <table className="w-full text-sm">
-                                              <thead className="bg-muted/30">
-                                                <tr>
-                                                  <th className="px-3 py-2 text-left">
-                                                    File
-                                                  </th>
-                                                  <th className="px-3 py-2 text-center">
-                                                    Pitch
-                                                  </th>
-                                                  <th className="px-3 py-2 text-center">
-                                                    Rhythm
-                                                  </th>
-                                                  <th className="px-3 py-2 text-center">
-                                                    Tone
-                                                  </th>
-                                                  <th className="px-3 py-2 text-center">
-                                                    Expression
-                                                  </th>
-                                                  <th className="px-3 py-2 text-center">
-                                                    Consistency
-                                                  </th>
-                                                  <th className="px-3 py-2 text-center">
-                                                    Final
-                                                  </th>
-                                                  <th className="px-3 py-2 text-center">
-                                                    Rank
-                                                  </th>
-                                                </tr>
-                                              </thead>
-                                              <tbody>
-                                                {recording.ai_result.results!.map(
-                                                  (
-                                                    r: AiFileScore,
-                                                    i: number
-                                                  ) => (
-                                                    <tr
-                                                      key={i}
-                                                      className="border-t"
-                                                    >
-                                                      <td className="px-3 py-2">
-                                                        {r.filename}
-                                                      </td>
-                                                      <td className="px-3 py-2 text-center">
-                                                        {(
-                                                          r.pitch * 100
-                                                        ).toFixed(0)}
-                                                        %
-                                                      </td>
-                                                      <td className="px-3 py-2 text-center">
-                                                        {(
-                                                          r.rhythm * 100
-                                                        ).toFixed(0)}
-                                                        %
-                                                      </td>
-                                                      <td className="px-3 py-2 text-center">
-                                                        {(r.tone * 100).toFixed(
-                                                          0
-                                                        )}
-                                                        %
-                                                      </td>
-                                                      <td className="px-3 py-2 text-center">
-                                                        {(
-                                                          r.expression * 100
-                                                        ).toFixed(0)}
-                                                        %
-                                                      </td>
-                                                      <td className="px-3 py-2 text-center">
-                                                        {(
-                                                          r.consistency * 100
-                                                        ).toFixed(0)}
-                                                        %
-                                                      </td>
-                                                      <td className="px-3 py-2 text-center font-bold">
-                                                        {(
-                                                          r.final_score * 100
-                                                        ).toFixed(1)}
-                                                      </td>
-                                                      <td className="px-3 py-2 text-center">
-                                                        {r.rank ?? "--"}
-                                                      </td>
-                                                    </tr>
-                                                  )
-                                                )}
-                                              </tbody>
-                                            </table>
-                                          </div>
-                                        ) : (
-                                          <p className="text-sm text-muted-foreground">
-                                            No per-file results available.
-                                          </p>
-                                        )}
-
-                                        {recording.ai_result.message && (
-                                          <p className="text-xs text-muted-foreground mt-2">
-                                            Message:{" "}
-                                            {recording.ai_result.message}
-                                          </p>
-                                        )}
-                                      </>
-                                    ) : (
-                                      <p className="text-sm text-muted-foreground">
-                                        AI result not available yet.
-                                      </p>
-                                    )}
-                                  </div>
-                                </div>
-                              </td>
-                            </tr>
-                          )}
-                        </tbody>
-                      );
-                    }
-                  )
+                        )}
+                      </React.Fragment>
+                    );
+                  })
                 )}
               </tbody>
             </table>
